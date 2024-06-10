@@ -8,119 +8,175 @@
 // Remove the parts that are not relevant to you, and add your own code
 // for external hardware libraries.
 
-#include "sensesp/sensors/analog_input.h"
-#include "sensesp/sensors/digital_input.h"
-#include "sensesp/sensors/sensor.h"
-#include "sensesp/signalk/signalk_output.h"
-#include "sensesp/system/lambda_consumer.h"
+#include <NMEA2000_esp32.h>
+
+#include "Wire.h"
+#include "sender/n2k_senders.h"
+#include "sensesp/system/serial_number.h"
+#include "sensesp/transforms/typecast.h"
 #include "sensesp_app_builder.h"
+#include "sensesp_nmea0183/data/wind_data.h"
+#include "sensesp_nmea0183/sentence_parser/wind_sentence_parser.h"
+#include "sensesp_nmea0183/wiring.h"
+#include "ssd1306_display.h"
 
 using namespace sensesp;
 
 reactesp::ReactESP app;
 
+constexpr int kWindBitRate = 4800;
+constexpr int kWindRxPin = 19;
+// set the Tx pin to -1 if you don't want to use it
+constexpr int kWindTxPin = 18;
+
+// CAN bus pins for SH-ESP32
+constexpr gpio_num_t kCANRxPin = GPIO_NUM_34;
+constexpr gpio_num_t kCANTxPin = GPIO_NUM_32;
+
 // The setup function performs one-time application initialization.
 void setup() {
-#ifndef SERIAL_DEBUG_DISABLED
-  SetupSerialDebug(115200);
-#endif
+  SetupLogging();
+
+  esp_log_level_set("*", esp_log_level_t::ESP_LOG_DEBUG);
+
+  Serial.begin(115200);
+
+  Serial1.begin(4800, SERIAL_8N1, 19, 18);
+
+  // Scan I2C bus for devices
+
+  char error = 0;
+  char address;
+  char num_devices = 0;
+
+  Wire.setPins(16, 17);
+  Wire.begin();
+
+  for (address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println(" !");
+      num_devices++;
+    } else if (error == 4) {
+      Serial.print("Unknown error at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }
+  }
 
   // Construct the global SensESPApp() object
   SensESPAppBuilder builder;
   sensesp_app = (&builder)
                     // Set a custom hostname for the app.
-                    ->set_hostname("my-sensesp-project")
-                    // Optionally, hard-code the WiFi and Signal K server
-                    // settings. This is normally not needed.
-                    //->set_wifi("My WiFi SSID", "my_wifi_password")
-                    //->set_sk_server("192.168.10.3", 80)
+                    ->set_hostname("wind-n2k")
+                    ->enable_ota("thisisfine")
                     ->get_app();
 
-  // GPIO number to use for the analog input
-  const uint8_t kAnalogInputPin = 36;
-  // Define how often (in milliseconds) new samples are acquired
-  const unsigned int kAnalogInputReadInterval = 500;
-  // Define the produced value at the maximum input voltage (3.3V).
-  // A value of 3.3 gives output equal to the input voltage.
-  const float kAnalogInputScale = 3.3;
+  Serial1.begin(kWindBitRate, SERIAL_8N1, kWindRxPin, kWindTxPin);
 
-  // Create a new Analog Input Sensor that reads an analog input pin
-  // periodically.
-  auto* analog_input = new AnalogInput(
-      kAnalogInputPin, kAnalogInputReadInterval, "", kAnalogInputScale);
+  NMEA0183* nmea = new NMEA0183(&Serial1);
 
-  // Add an observer that prints out the current value of the analog input
-  // every time it changes.
-  analog_input->attach([analog_input]() {
-    debugD("Analog input value: %f", analog_input->get());
+  ApparentWindData* apparent_wind_data = new ApparentWindData();
+
+  WIMWVSentenceParser* wind_sentence_parser = new WIMWVSentenceParser(
+      nmea, &apparent_wind_data->speed, &apparent_wind_data->angle);
+
+  apparent_wind_data->angle.connect_to(new SKOutputFloat(
+      "environment.wind.angleApparent", "/SK Path/Apparent Wind Angle"));
+  apparent_wind_data->speed.connect_to(new SKOutputFloat(
+      "environment.wind.speedApparent", "/SK Path/Apparent Wind Speed"));
+
+  // Send wind instrument configuration messages at startup
+  ReactESP::app->onDelay(10000, [nmea]() {
+    String msg;
+    char checksum;
+    char buf[200];
+
+    msg = "$PATC,IIMWV,CFG,10";
+    checksum = CalculateChecksum(msg.c_str());
+    // sprintf(buf, "%s*%02X\r\n", msg.c_str(), checksum);
+    sprintf(buf, "%s\r\n", msg.c_str());
+    ESP_LOGD("NMEA0183", "Sending %s", buf);
+    nmea->output_raw(buf);
+
+    msg = "$PATC,IIMWV,TXP,100";
+    checksum = CalculateChecksum(msg.c_str());
+    // sprintf(buf, "%s*%02X\r\n", msg.c_str(), checksum);
+    sprintf(buf, "%s\r\n", msg.c_str());
+    ESP_LOGD("NMEA0183", "Sending %s", buf);
+    nmea->output_raw(buf);
   });
 
-  // Set GPIO pin 15 to output and toggle it every 650 ms
+  /////////////////////////////////////////////////////////////////////
+  // Initialize NMEA 2000 functionality
 
-  const uint8_t kDigitalOutputPin = 15;
-  const unsigned int kDigitalOutputInterval = 650;
-  pinMode(kDigitalOutputPin, OUTPUT);
-  app.onRepeat(kDigitalOutputInterval, [kDigitalOutputPin]() {
-    digitalWrite(kDigitalOutputPin, !digitalRead(kDigitalOutputPin));
-  });
+  tNMEA2000* nmea2000 = new tNMEA2000_esp32(kCANTxPin, kCANRxPin);
 
-  // Read GPIO 14 every time it changes
+  // Reserve enough buffer for sending all messages.
+  nmea2000->SetN2kCANSendFrameBufSize(250);
+  nmea2000->SetN2kCANReceiveFrameBufSize(250);
 
-  const uint8_t kDigitalInput1Pin = 14;
-  auto* digital_input1 =
-      new DigitalInputChange(kDigitalInput1Pin, INPUT_PULLUP, CHANGE);
+  // Set Product information
+  // EDIT: Change the values below to match your device.
+  nmea2000->SetProductInformation(
+      "20240601",  // Manufacturer's Model serial code (max 32 chars)
+      105,         // Manufacturer's product code
+      "Wind-N2K",  // Manufacturer's Model ID (max 33 chars)
+      "1.0.0",     // Manufacturer's Software version code (max 40 chars)
+      "1.0.0"      // Manufacturer's Model version (max 24 chars)
+  );
 
-  // Connect the digital input to a lambda consumer that prints out the
-  // value every time it changes.
+  // For device class/function information, see:
+  // http://www.nmea.org/Assets/20120726%20nmea%202000%20class%20&%20function%20codes%20v%202.00.pdf
 
-  // Test this yourself by connecting pin 15 to pin 14 with a jumper wire and
-  // see if the value changes!
+  // For mfg registration list, see:
+  // https://actisense.com/nmea-certified-product-providers/
+  // The format is inconvenient, but the manufacturer code below should be
+  // one not already on the list.
 
-  digital_input1->connect_to(new LambdaConsumer<bool>(
-      [](bool input) { debugD("Digital input value changed: %d", input); }));
+  // EDIT: Change the class and function values below to match your device.
+  nmea2000->SetDeviceInformation(
+      GetBoardSerialNumber(),  // Unique number. Use e.g. Serial number.
+      130,                     // Device function: Weather Instruments
+      85,                      // Device class: Sensor Communication Interface
+      2046);                   // Manufacturer code
 
-  // Create another digital input, this time with RepeatSensor. This approach
-  // can be used to connect external sensor library to SensESP!
+  nmea2000->SetMode(tNMEA2000::N2km_NodeOnly,
+                    72  // Default N2k node address
+  );
+  nmea2000->EnableForward(false);
+  nmea2000->Open();
 
-  const uint8_t kDigitalInput2Pin = 13;
-  const unsigned int kDigitalInput2Interval = 1000;
+  // No need to parse the messages at every single loop iteration; 1 ms will do
+  app.onRepeat(1, [nmea2000]() { nmea2000->ParseMessages(); });
 
-  // Configure the pin. Replace this with your custom library initialization
-  // code!
-  pinMode(kDigitalInput2Pin, INPUT_PULLUP);
+  /////////////////////////////////////////////////////////////////////
+  // Initialize NMEA 2000 wind data sender
 
-  // Define a new RepeatSensor that reads the pin every 100 ms.
-  // Replace the lambda function internals with the input routine of your custom
-  // library.
+  N2kWindDataSender* wind_data_sender = new N2kWindDataSender(
+      "/Wind/NMEA2000", tN2kWindReference::N2kWind_Apparent, nmea2000, true);
 
-  // Again, test this yourself by connecting pin 15 to pin 13 with a jumper
-  // wire and see if the value changes!
+  apparent_wind_data->speed.connect_to(
+      &(wind_data_sender->wind_speed_consumer_));
 
-  auto* digital_input2 = new RepeatSensor<bool>(
-      kDigitalInput2Interval,
-      [kDigitalInput2Pin]() { return digitalRead(kDigitalInput2Pin); });
+  apparent_wind_data->angle.connect_to(
+      &(wind_data_sender->wind_angle_consumer_));
 
-  // Connect the analog input to Signal K output. This will publish the
-  // analog input value to the Signal K server every time it changes.
-  analog_input->connect_to(new SKOutputFloat(
-      "sensors.analog_input.voltage",         // Signal K path
-      "/sensors/analog_input/voltage",        // configuration path, used in the
-                                              // web UI and for storing the
-                                              // configuration
-      new SKMetadata("V",                     // Define output units
-                     "Analog input voltage")  // Value description
-      ));
+  /////////////////////////////////////////////////////////////////////
+  // Initialize the OLED display
 
-  // Connect digital input 2 to Signal K output.
-  digital_input2->connect_to(new SKOutputBool(
-      "sensors.digital_input2.value",          // Signal K path
-      "/sensors/digital_input2/value",         // configuration path
-      new SKMetadata("",                       // No units for boolean values
-                     "Digital input 2 value")  // Value description
-      ));
+  InfoDisplay* display = new InfoDisplay(&Wire);
+  apparent_wind_data->speed.connect_to(
+      &(display->apparent_wind_speed_consumer));
+  apparent_wind_data->angle.connect_to(
+      &(display->apparent_wind_angle_consumer));
 
-  // Start networking, SK server connections and other SensESP internals
-  sensesp_app->start();
+  /////////////////////////////////////////////////////////////////////
+  // TODO: Initialize the ICM-20948 IMU
 }
 
 void loop() { app.tick(); }
