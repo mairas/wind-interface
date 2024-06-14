@@ -4,6 +4,8 @@
 #include <N2kMessages.h>
 #include <NMEA2000.h>
 
+#include <tuple>
+
 #include "sensesp/system/configurable.h"
 #include "sensesp/system/expiring_value.h"
 #include "sensesp/system/lambda_consumer.h"
@@ -31,7 +33,8 @@ class N2kSender : public Configurable {
   RepeatReaction* sender_reaction_ = nullptr;
 };
 
-class N2kWindDataSender : public N2kSender {
+class N2kWindDataSender : public N2kSender,
+                          public ValueProducer<std::pair<double, double>> {
  public:
   N2kWindDataSender(String config_path, tN2kWindReference wind_reference,
                     tNMEA2000* nmea2000, bool enable = true)
@@ -58,6 +61,9 @@ class N2kWindDataSender : public N2kSender {
             SetN2kWindSpeed(N2kMsg, 255, this->wind_speed_.get(),
                             this->wind_angle_.get(), this->wind_reference_);
             this->nmea2000_->SendMsg(N2kMsg);
+            std::pair<double, double> wind_data = std::make_pair(
+                this->wind_speed_.get(), this->wind_angle_.get());
+            this->emit(wind_data);
           });
     }
   }
