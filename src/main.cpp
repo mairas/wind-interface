@@ -11,9 +11,15 @@
 #include <NMEA2000_esp32.h>
 
 #include "Wire.h"
+#include "autonnic_a5120_parser.h"
+#include "autonnic_config.h"
+#include "elapsedMillis.h"
 #include "sender/n2k_senders.h"
 #include "sensesp/system/serial_number.h"
 #include "sensesp/transforms/typecast.h"
+#include "sensesp/transforms/zip.h"
+#include "sensesp/ui/ui_controls.h"
+#include "sensesp/ui/ui_output.h"
 #include "sensesp_app_builder.h"
 #include "sensesp_nmea0183/data/wind_data.h"
 #include "sensesp_nmea0183/sentence_parser/wind_sentence_parser.h"
@@ -33,11 +39,17 @@ constexpr int kWindTxPin = 18;
 constexpr gpio_num_t kCANRxPin = GPIO_NUM_34;
 constexpr gpio_num_t kCANTxPin = GPIO_NUM_32;
 
+int n2k_rx_counter = 0;
+int n2k_tx_counter = 0;
+
+elapsedMillis n2k_time_since_rx = 0;
+elapsedMillis n2k_time_since_tx = 0;
+
 // The setup function performs one-time application initialization.
 void setup() {
   SetupLogging();
 
-  esp_log_level_set("*", esp_log_level_t::ESP_LOG_DEBUG);
+  // esp_log_level_set("*", esp_log_level_t::ESP_LOG_DEBUG);
 
   Serial.begin(115200);
 
@@ -72,7 +84,7 @@ void setup() {
   SensESPAppBuilder builder;
   sensesp_app = (&builder)
                     // Set a custom hostname for the app.
-                    ->set_hostname("wind-n2k")
+                    ->set_hostname("wind")
                     ->enable_ota("thisisfine")
                     ->get_app();
 
@@ -82,34 +94,39 @@ void setup() {
 
   ApparentWindData* apparent_wind_data = new ApparentWindData();
 
-  WIMWVSentenceParser* wind_sentence_parser = new WIMWVSentenceParser(
-      nmea, &apparent_wind_data->speed, &apparent_wind_data->angle);
+  ConnectApparentWind(nmea, apparent_wind_data);
 
-  apparent_wind_data->angle.connect_to(new SKOutputFloat(
-      "environment.wind.angleApparent", "/SK Path/Apparent Wind Angle"));
-  apparent_wind_data->speed.connect_to(new SKOutputFloat(
-      "environment.wind.speedApparent", "/SK Path/Apparent Wind Speed"));
+  // Connect the response parser
+  AutonnicPATCWIMWVParser* autonnic_response_parser =
+      new AutonnicPATCWIMWVParser(nmea);
 
-  // Send wind instrument configuration messages at startup
-  ReactESP::app->onDelay(10000, [nmea]() {
-    String msg;
-    char checksum;
-    char buf[200];
+  ReferenceAngleConfig* reference_angle_config = new ReferenceAngleConfig(
+      0, nmea, autonnic_response_parser, "/Wind/Reference Angle");
+  reference_angle_config->set_description(
+      "Reference angle offset for wind data (in degrees). Enter the angle "
+      "readout when the wind vane is pointing straight ahead.");
+  reference_angle_config->set_sort_order(300);
 
-    msg = "$PATC,IIMWV,CFG,10";
-    checksum = CalculateChecksum(msg.c_str());
-    // sprintf(buf, "%s*%02X\r\n", msg.c_str(), checksum);
-    sprintf(buf, "%s\r\n", msg.c_str());
-    ESP_LOGD("NMEA0183", "Sending %s", buf);
-    nmea->output_raw(buf);
+  WindDirectionDampingConfig* wind_direction_damping_config =
+      new WindDirectionDampingConfig(50.0, nmea, autonnic_response_parser,
+                                     "/Wind/Direction Damping");
+  wind_direction_damping_config->set_description(
+      "Wind direction damping factor (0-100.0). Default is 50.0.");
+  wind_direction_damping_config->set_sort_order(400);
 
-    msg = "$PATC,IIMWV,TXP,100";
-    checksum = CalculateChecksum(msg.c_str());
-    // sprintf(buf, "%s*%02X\r\n", msg.c_str(), checksum);
-    sprintf(buf, "%s\r\n", msg.c_str());
-    ESP_LOGD("NMEA0183", "Sending %s", buf);
-    nmea->output_raw(buf);
-  });
+  WindSpeedDampingConfig* wind_speed_damping_config =
+      new WindSpeedDampingConfig(50.0, nmea, autonnic_response_parser,
+                                 "/Wind/Speed Damping");
+  wind_speed_damping_config->set_description(
+      "Wind speed damping factor (0-100.0). Default is 50.0.");
+  wind_speed_damping_config->set_sort_order(500);
+
+  WindOutputRepetitionRateConfig* wind_output_repetition_rate_config =
+      new WindOutputRepetitionRateConfig(500, nmea, autonnic_response_parser,
+                                         "/Wind/Message Repetition Rate");
+  wind_output_repetition_rate_config->set_description(
+      "Wind message repetition rate in milliseconds. Default is 500.");
+  wind_output_repetition_rate_config->set_sort_order(200);
 
   /////////////////////////////////////////////////////////////////////
   // Initialize NMEA 2000 functionality
@@ -148,6 +165,10 @@ void setup() {
   nmea2000->SetMode(tNMEA2000::N2km_NodeOnly,
                     72  // Default N2k node address
   );
+  nmea2000->SetMsgHandler([](const tN2kMsg& msg) {
+    n2k_rx_counter++;
+    n2k_time_since_rx = 0;
+  });
   nmea2000->EnableForward(false);
   nmea2000->Open();
 
@@ -165,6 +186,45 @@ void setup() {
 
   apparent_wind_data->angle.connect_to(
       &(wind_data_sender->wind_angle_consumer_));
+
+  // wind_data_sender emits whenever it sends a message; count the messages
+  wind_data_sender->connect_to(new LambdaConsumer<std::pair<double, double>>(
+      [](std::pair<double, double> wind_data) {
+        n2k_tx_counter++;
+        n2k_time_since_tx = 0;
+      }));
+
+  /////////////////////////////////////////////////////////////////////
+  // Configuration elements
+
+  CheckboxConfig* enable_n2k_watchdog_config = new CheckboxConfig(
+      false, "Enable NMEA 2000 Watchdog", "/NMEA2000/Enable Watchdog");
+  enable_n2k_watchdog_config->set_description(
+      "Enable the NMEA 2000 watchdog. If enabled, the device will reboot after "
+      "two minutes if no NMEA 2000 messages are received. This setting "
+      "requires "
+      "a device restart to take effect.");
+  enable_n2k_watchdog_config->set_sort_order(100);
+
+  if (enable_n2k_watchdog_config->get_value()) {
+    app.onRepeat(1000, [nmea2000]() {
+      if (n2k_time_since_rx > 120000) {
+        ESP_LOGE("NMEA2000", "No messages received in 2 minutes. Restarting.");
+        // All hope is lost; it doesn't matter if we delay for a bit to ensure
+        // the log message is sent.
+        delay(10);
+        ESP.restart();
+      }
+    });
+  }
+
+  UILambdaOutput<int>* n2k_rx_ui_output = new UILambdaOutput<int>(
+      "NMEA 2000 Received Messages", []() { return n2k_rx_counter; },
+      "NMEA 2000", 300);
+
+  UILambdaOutput<int>* n2k_tx_ui_output = new UILambdaOutput<int>(
+      "NMEA 2000 Transmitted Messages", []() { return n2k_tx_counter; },
+      "NMEA 2000", 310);
 
   /////////////////////////////////////////////////////////////////////
   // Initialize the OLED display
