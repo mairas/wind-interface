@@ -1,9 +1,10 @@
-# SensESP Project Template
+# NMEA0183 Wind Instrument Interface
 
-This repository provides a template for [SensESP](https://github.com/SignalK/SensESP/) projects.
-Fork, clone or download the repository and try building and uploading the project to an ESP32 device.
-You should immediately see output on the serial monitor!
+This project provides a configuration interface and NMEA 2000 as well as
+Signal K connectivity for
+an Autonnic A5120 wind instrument. All documented configuration messages are
+supported.
 
-To customize the template for your own purposes, edit the `src/main.cpp` and `platformio.ini` files.
-
-Comprehensive documentation for SensESP, including how to get started with your own project, is available at the [SensESP documentation site](https://signalk.org/SensESP/).
+To build, clone the repository and build and upload in PlatformIO. The project
+assumes SH-ESP32 hardware with two additional RS485 interface modules for
+bidirectional NMEA0183 communication.
