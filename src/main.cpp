@@ -16,6 +16,8 @@
 #include "elapsedMillis.h"
 #include "sender/n2k_senders.h"
 #include "sensesp/system/serial_number.h"
+#include "sensesp/system/stream_producer.h"
+#include "sensesp/transforms/filter.h"
 #include "sensesp/transforms/typecast.h"
 #include "sensesp/transforms/zip.h"
 #include "sensesp/ui/ui_controls.h"
@@ -27,8 +29,7 @@
 #include "ssd1306_display.h"
 
 using namespace sensesp;
-
-reactesp::ReactESP app;
+using namespace sensesp::nmea0183;
 
 constexpr int kWindBitRate = 4800;
 constexpr int kWindRxPin = 19;
@@ -90,7 +91,16 @@ void setup() {
 
   Serial1.begin(kWindBitRate, SERIAL_8N1, kWindRxPin, kWindTxPin);
 
-  NMEA0183* nmea = new NMEA0183(&Serial1);
+  StreamLineProducer* wind_line_producer = new StreamLineProducer(&Serial1);
+
+  Filter<String>* sentence_filter = new Filter<String>([](const String& line) {
+    return line.startsWith("!") || line.startsWith("$");
+  });
+
+  wind_line_producer->connect_to(sentence_filter);
+
+  NMEA0183* nmea = new NMEA0183();
+  sentence_filter->connect_to(nmea);
 
   ApparentWindData* apparent_wind_data = new ApparentWindData();
 
@@ -101,28 +111,28 @@ void setup() {
       new AutonnicPATCWIMWVParser(nmea);
 
   ReferenceAngleConfig* reference_angle_config = new ReferenceAngleConfig(
-      0, nmea, autonnic_response_parser, "/Wind/Reference Angle");
+      0, &Serial1, autonnic_response_parser, "/Wind/Reference Angle");
   reference_angle_config->set_description(
       "Reference angle offset for wind data (in degrees). Enter the angle "
       "readout when the wind vane is pointing straight ahead.");
   reference_angle_config->set_sort_order(300);
 
   WindDirectionDampingConfig* wind_direction_damping_config =
-      new WindDirectionDampingConfig(50.0, nmea, autonnic_response_parser,
+      new WindDirectionDampingConfig(50.0, &Serial1, autonnic_response_parser,
                                      "/Wind/Direction Damping");
   wind_direction_damping_config->set_description(
       "Wind direction damping factor (0-100.0). Default is 50.0.");
   wind_direction_damping_config->set_sort_order(400);
 
   WindSpeedDampingConfig* wind_speed_damping_config =
-      new WindSpeedDampingConfig(50.0, nmea, autonnic_response_parser,
+      new WindSpeedDampingConfig(50.0, &Serial1, autonnic_response_parser,
                                  "/Wind/Speed Damping");
   wind_speed_damping_config->set_description(
       "Wind speed damping factor (0-100.0). Default is 50.0.");
   wind_speed_damping_config->set_sort_order(500);
 
   WindOutputRepetitionRateConfig* wind_output_repetition_rate_config =
-      new WindOutputRepetitionRateConfig(500, nmea, autonnic_response_parser,
+      new WindOutputRepetitionRateConfig(500, &Serial1, autonnic_response_parser,
                                          "/Wind/Message Repetition Rate");
   wind_output_repetition_rate_config->set_description(
       "Wind message repetition rate in milliseconds. Default is 500.");
@@ -173,7 +183,7 @@ void setup() {
   nmea2000->Open();
 
   // No need to parse the messages at every single loop iteration; 1 ms will do
-  app.onRepeat(1, [nmea2000]() { nmea2000->ParseMessages(); });
+  SensESPBaseApp::get_event_loop()->onRepeat(1, [nmea2000]() { nmea2000->ParseMessages(); });
 
   /////////////////////////////////////////////////////////////////////
   // Initialize NMEA 2000 wind data sender
@@ -207,7 +217,7 @@ void setup() {
   enable_n2k_watchdog_config->set_sort_order(100);
 
   if (enable_n2k_watchdog_config->get_value()) {
-    app.onRepeat(1000, [nmea2000]() {
+    SensESPBaseApp::get_event_loop()->onRepeat(1000, [nmea2000]() {
       if (n2k_time_since_rx > 120000) {
         ESP_LOGE("NMEA2000", "No messages received in 2 minutes. Restarting.");
         // All hope is lost; it doesn't matter if we delay for a bit to ensure
@@ -239,4 +249,4 @@ void setup() {
   // TODO: Initialize the ICM-20948 IMU
 }
 
-void loop() { app.tick(); }
+void loop() { SensESPBaseApp::get_event_loop()->tick(); }

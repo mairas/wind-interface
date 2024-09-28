@@ -17,7 +17,7 @@ class AutonnicPATCWIMWVParser : public SentenceParser {
 
   virtual const char *sentence_address() override final { return "PATC,WIMWV"; }
 
-  bool parse_fields(char *field_strings, int field_offsets[],
+  bool parse_fields(const char *field_strings, const int field_offsets[],
                     int num_fields) override final {
     // Example sentence: $PATC,WIMWV,ACK
 
@@ -31,20 +31,20 @@ class AutonnicPATCWIMWVParser : public SentenceParser {
       return false;
     }
 
-    if (strcmp(field_strings + field_offsets[0], "ACK") == 0) {
-      result_.set(true);
-    } else {
-      result_.set(false);
-    }
-    result_string_.set(String(field_strings + field_offsets[0]));
+    bool result;
 
-    ESP_LOGD("AutonnicPATCWIMWVParser", "Result: %d", result_.get());
+    if (strcmp(field_strings + field_offsets[0], "ACK") == 0) {
+      result = true;
+    } else {
+      result = false;
+    }
+
+    emit(result);
+    ESP_LOGD("AutonnicPATCWIMWVParser", "Result: %d", result);
 
     return true;
   }
 
-  ObservableValue<bool> result_;
-  ObservableValue<String> result_string_;
 };
 
 #endif  // AUTONNIC_WIND_SRC_AUTONNIC_A5120_PARSER_H_

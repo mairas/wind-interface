@@ -9,6 +9,7 @@
 #include "ReactESP.h"
 #include "autonnic_a5120_parser.h"
 #include "sensesp.h"
+#include "sensesp/system/async_response_handler.h"
 #include "sensesp/system/configurable.h"
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp_nmea0183/nmea0183.h"
@@ -48,99 +49,16 @@ String AutonnicMessageRepetitionRateSentence(const int& repetition_rate) {
   return buf;
 }
 
-enum AsyncCommandStatus {
-  kReady,
-  kPending,
-  kSuccess,
-  kFailure,
-  kTimeout,
-};
-
-/**
- * @brief Abstract base class for handling async command sending to remote
- * systems.
- *
- * This class is used to send a command to a remote system and wait for a
- * response. The response is then emitted as a value.
- *
- * @tparam T Command data type
- * @tparam U Response data type
- */
-template <typename T, typename U>
-class AsyncCommand : public ValueProducer<U> {
+class ReferenceAngleConfig : public Configurable {
  public:
-  AsyncCommand() : ValueProducer<U>() {}
-  AsyncCommand(int timeout) : ValueProducer<U>(), timeout_{timeout} {}
-
-  bool send(T value) {
-    elapsed_millis_ = 0;
-    status_ = kPending;
-
-    if (timeout_reaction_ != nullptr) {
-      ReactESP::app->remove(timeout_reaction_);
-      timeout_reaction_ = nullptr;
-    }
-    timeout_reaction_ = ReactESP::app->onDelay(timeout_, [this]() {
-      if (status_ == kPending) {
-        status_ = kTimeout;
-      }
-      this->timeout_reaction_ = nullptr;
-    });
-
-    // Send a command to the device
-    return send_command(value);
-  }
-
-  /**
-   * @brief Send a command to the remote system.
-   *
-   * @param value
-   * @return true
-   * @return false
-   */
-  virtual bool send_command(T value) = 0;
-
- protected:
-  DelayReaction* timeout_reaction_ = nullptr;
-  AsyncCommandStatus status_ = kReady;
-  String result_message_;
-  int timeout_ = 3000;  // Default timeout in ms
-  elapsedMillis elapsed_millis_;
-
-  void report_result(bool success, U& result) {
-    if (status_ != kPending) {
-      return;
-    }
-
-    // Clear the timeout reaction
-    if (timeout_reaction_ != nullptr) {
-      ReactESP::app->remove(timeout_reaction_);
-      timeout_reaction_ = nullptr;
-    }
-
-    if (success) {
-      status_ = kSuccess;
-      this->emit(result);
-    } else {
-      status_ = kFailure;
-    }
-  }
-};
-
-class ReferenceAngleConfig : public Configurable,
-                             public AsyncCommand<float, bool> {
- public:
-  ReferenceAngleConfig(float offset, const NMEA0183* nmea0183,
+  ReferenceAngleConfig(float offset, Stream* serial,
                        AutonnicPATCWIMWVParser* parser, String config_path = "")
       : Configurable(config_path),
-        AsyncCommand(),
         offset_{offset},
-        nmea0183_{nmea0183},
+        serial_{serial},
         parser_{parser} {
-    parser->result_.connect_to(new LambdaConsumer<bool>([this](bool result) {
-      report_result(result, result);  // Result also indicates success status
-    }));
     load_configuration();
+    parser_->connect_to(&set_response_handler_);
   }
 
   virtual void get_configuration(JsonObject& doc) override {
@@ -152,7 +70,7 @@ class ReferenceAngleConfig : public Configurable,
   virtual ConfigurableResult async_get_configuration() override {
     // Autonnic A5120 does not support getting the configuration. Indicate
     // that the locally stored configuration is available.
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual ConfigurableResult poll_get_result(
@@ -160,7 +78,7 @@ class ReferenceAngleConfig : public Configurable,
     // Autonnic A5120 does not support getting the configuration, so just
     // return the current locally stored configuration.
     get_configuration(config_object);
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual bool set_configuration(const JsonObject& config) override {
@@ -177,36 +95,33 @@ class ReferenceAngleConfig : public Configurable,
   virtual ConfigurableResult async_set_configuration(
       const JsonObject& config) override {
     if (!set_configuration(config)) {
-      return ConfigurableResult::kConfigError;
+      return ConfigurableResult::kError;
     }
-    this->send(offset_);
-    return ConfigurableResult::kConfigPending;
+    // Send the command to the device
+    ESP_LOGD("ReferenceAngleConfig", "Sending command: %f", offset_);
+    String sentence = AutonnicReferenceAngleSentence(offset_);
+    ESP_LOGD("ReferenceAngleConfig", "Sending sentence: %s", sentence.c_str());
+    serial_->println(sentence);
+    set_response_handler_.activate();
+    return ConfigurableResult::kPending;
   }
 
   virtual ConfigurableResult poll_set_result() override {
-    ESP_LOGV("ReferenceAngleConfig", "status_: %d", status_);
-    switch (status_) {
-      case kReady:
-        return ConfigurableResult::kConfigOk;
-      case kPending:
-        return ConfigurableResult::kConfigPending;
-      case kSuccess:
-        return ConfigurableResult::kConfigOk;
-      case kFailure:
-        return ConfigurableResult::kConfigError;
-      case kTimeout:
-        return ConfigurableResult::kConfigError;
+    auto status = set_response_handler_.get_status();
+    ESP_LOGV("ReferenceAngleConfig", "status_: %d", status);
+    switch (status) {
+      case AsyncResponseStatus::kReady:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kPending:
+        return ConfigurableResult::kPending;
+      case AsyncResponseStatus::kSuccess:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kFailure:
+        return ConfigurableResult::kError;
+      case AsyncResponseStatus::kTimeout:
+        return ConfigurableResult::kError;
     }
-    return ConfigurableResult::kConfigError;
-  }
-
-  virtual bool send_command(float value) override {
-    // Send the command to the device
-    ESP_LOGD("ReferenceAngleConfig", "Sending command: %f", value);
-    String sentence = AutonnicReferenceAngleSentence(value);
-    ESP_LOGD("ReferenceAngleConfig", "Sending sentence: %s", sentence.c_str());
-    nmea0183_->output_raw(sentence.c_str());
-    return true;  // Cannot fail
+    return ConfigurableResult::kError;
   }
 
   virtual String get_config_schema() override {
@@ -221,25 +136,22 @@ class ReferenceAngleConfig : public Configurable,
 
  protected:
   float offset_;  // Offset in radians
-  const NMEA0183* nmea0183_;
+  Stream* serial_;
   AutonnicPATCWIMWVParser* parser_;
+  AsyncResponseHandler set_response_handler_;
 };
 
-class WindDirectionDampingConfig : public Configurable,
-                                   public AsyncCommand<float, bool> {
+class WindDirectionDampingConfig : public Configurable {
  public:
-  WindDirectionDampingConfig(float damping_factor, const NMEA0183* nmea0183,
+  WindDirectionDampingConfig(float damping_factor, Stream* serial,
                              AutonnicPATCWIMWVParser* parser,
                              String config_path = "")
       : Configurable(config_path),
-        AsyncCommand(),
         damping_factor_{damping_factor},
-        nmea0183_{nmea0183},
+        serial_{serial},
         parser_{parser} {
-    parser->result_.connect_to(new LambdaConsumer<bool>([this](bool result) {
-      report_result(result, result);  // Result also indicates success status
-    }));
     load_configuration();
+    parser_->connect_to(&set_response_handler_);
   }
 
   virtual void get_configuration(JsonObject& doc) override {
@@ -251,7 +163,7 @@ class WindDirectionDampingConfig : public Configurable,
   virtual ConfigurableResult async_get_configuration() override {
     // Autonnic A5120 does not support getting the configuration. Indicate
     // that the locally stored configuration is available.
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual ConfigurableResult poll_get_result(
@@ -259,7 +171,7 @@ class WindDirectionDampingConfig : public Configurable,
     // Autonnic A5120 does not support getting the configuration, so just
     // return the current locally stored configuration.
     get_configuration(config_object);
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual bool set_configuration(const JsonObject& config) override {
@@ -276,37 +188,35 @@ class WindDirectionDampingConfig : public Configurable,
   virtual ConfigurableResult async_set_configuration(
       const JsonObject& config) override {
     if (!set_configuration(config)) {
-      return ConfigurableResult::kConfigError;
+      return ConfigurableResult::kError;
     }
-    this->send(damping_factor_);
-    return ConfigurableResult::kConfigPending;
+    // Send the command to the device
+    ESP_LOGD("WindDirectionDampingConfig", "Sending command: %f",
+             damping_factor_);
+    String sentence = AutonnicWindDirectionDampingSentence(damping_factor_);
+    ESP_LOGD("WindDirectionDampingConfig", "Sending sentence: %s",
+             sentence.c_str());
+    serial_->println(sentence.c_str());
+    set_response_handler_.activate();
+    return ConfigurableResult::kPending;
   }
 
   virtual ConfigurableResult poll_set_result() override {
-    ESP_LOGV("WindDirectionDampingConfig", "status_: %d", status_);
-    switch (status_) {
-      case kReady:
-        return ConfigurableResult::kConfigOk;
-      case kPending:
-        return ConfigurableResult::kConfigPending;
-      case kSuccess:
-        return ConfigurableResult::kConfigOk;
-      case kFailure:
-        return ConfigurableResult::kConfigError;
-      case kTimeout:
-        return ConfigurableResult::kConfigError;
+    auto status = set_response_handler_.get_status();
+    ESP_LOGV("WindDirectionDampingConfig", "status_: %d", status);
+    switch (status) {
+      case AsyncResponseStatus::kReady:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kPending:
+        return ConfigurableResult::kPending;
+      case AsyncResponseStatus::kSuccess:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kFailure:
+        return ConfigurableResult::kError;
+      case AsyncResponseStatus::kTimeout:
+        return ConfigurableResult::kError;
     }
-    return ConfigurableResult::kConfigError;
-  }
-
-  virtual bool send_command(float value) override {
-    // Send the command to the device
-    ESP_LOGD("WindDirectionDampingConfig", "Sending command: %f", value);
-    String sentence = AutonnicWindDirectionDampingSentence(value);
-    ESP_LOGD("WindDirectionDampingConfig", "Sending sentence: %s",
-             sentence.c_str());
-    nmea0183_->output_raw(sentence.c_str());
-    return true;  // Cannot fail
+    return ConfigurableResult::kError;
   }
 
   virtual String get_config_schema() override {
@@ -321,25 +231,22 @@ class WindDirectionDampingConfig : public Configurable,
 
  protected:
   float damping_factor_;  // Damping factor in percent
-  const NMEA0183* nmea0183_;
+  Stream* serial_;
   AutonnicPATCWIMWVParser* parser_;
+  AsyncResponseHandler set_response_handler_;
 };
 
-class WindSpeedDampingConfig : public Configurable,
-                               public AsyncCommand<float, bool> {
+class WindSpeedDampingConfig : public Configurable {
  public:
-  WindSpeedDampingConfig(float damping_factor, const NMEA0183* nmea0183,
+  WindSpeedDampingConfig(float damping_factor, Stream* serial,
                          AutonnicPATCWIMWVParser* parser,
                          String config_path = "")
       : Configurable(config_path),
-        AsyncCommand(),
         damping_factor_{damping_factor},
-        nmea0183_{nmea0183},
+        serial_{serial},
         parser_{parser} {
-    parser->result_.connect_to(new LambdaConsumer<bool>([this](bool result) {
-      report_result(result, result);  // Result also indicates success status
-    }));
     load_configuration();
+    parser_->connect_to(&set_response_handler_);
   }
 
   virtual void get_configuration(JsonObject& doc) override {
@@ -351,7 +258,7 @@ class WindSpeedDampingConfig : public Configurable,
   virtual ConfigurableResult async_get_configuration() override {
     // Autonnic A5120 does not support getting the configuration. Indicate
     // that the locally stored configuration is available.
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual ConfigurableResult poll_get_result(
@@ -359,7 +266,7 @@ class WindSpeedDampingConfig : public Configurable,
     // Autonnic A5120 does not support getting the configuration, so just
     // return the current locally stored configuration.
     get_configuration(config_object);
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual bool set_configuration(const JsonObject& config) override {
@@ -376,37 +283,34 @@ class WindSpeedDampingConfig : public Configurable,
   virtual ConfigurableResult async_set_configuration(
       const JsonObject& config) override {
     if (!set_configuration(config)) {
-      return ConfigurableResult::kConfigError;
+      return ConfigurableResult::kError;
     }
-    this->send(damping_factor_);
-    return ConfigurableResult::kConfigPending;
+    // Send the command to the device
+    ESP_LOGD("WindSpeedDampingConfig", "Sending command: %f", damping_factor_);
+    String sentence = AutonnicWindSpeedDampingSentence(damping_factor_);
+    ESP_LOGD("WindSpeedDampingConfig", "Sending sentence: %s",
+             sentence.c_str());
+    serial_->println(sentence.c_str());
+    set_response_handler_.activate();
+    return ConfigurableResult::kPending;
   }
 
   virtual ConfigurableResult poll_set_result() override {
-    ESP_LOGV("WindSpeedDampingConfig", "status_: %d", status_);
-    switch (status_) {
-      case kReady:
-        return ConfigurableResult::kConfigOk;
-      case kPending:
-        return ConfigurableResult::kConfigPending;
-      case kSuccess:
-        return ConfigurableResult::kConfigOk;
-      case kFailure:
-        return ConfigurableResult::kConfigError;
-      case kTimeout:
-        return ConfigurableResult::kConfigError;
+    auto status = set_response_handler_.get_status();
+    ESP_LOGV("WindSpeedDampingConfig", "status_: %d", status);
+    switch (status) {
+      case AsyncResponseStatus::kReady:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kPending:
+        return ConfigurableResult::kPending;
+      case AsyncResponseStatus::kSuccess:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kFailure:
+        return ConfigurableResult::kError;
+      case AsyncResponseStatus::kTimeout:
+        return ConfigurableResult::kError;
     }
-    return ConfigurableResult::kConfigError;
-  }
-
-  virtual bool send_command(float value) override {
-    // Send the command to the device
-    ESP_LOGD("WindSpeedDampingConfig", "Sending command: %f", value);
-    String sentence = AutonnicWindSpeedDampingSentence(value);
-    ESP_LOGD("WindSpeedDampingConfig", "Sending sentence: %s",
-             sentence.c_str());
-    nmea0183_->output_raw(sentence.c_str());
-    return true;  // Cannot fail
+    return ConfigurableResult::kError;
   }
 
   virtual String get_config_schema() override {
@@ -421,26 +325,24 @@ class WindSpeedDampingConfig : public Configurable,
 
  protected:
   float damping_factor_;  // Damping factor in percent
-  const NMEA0183* nmea0183_;
+  Stream* serial_;
   AutonnicPATCWIMWVParser* parser_;
+  AsyncResponseHandler set_response_handler_;
 };
 
-class WindOutputRepetitionRateConfig : public Configurable,
-                                       public AsyncCommand<float, bool> {
+class WindOutputRepetitionRateConfig : public Configurable {
  public:
   WindOutputRepetitionRateConfig(float repetition_rate,
-                                 const NMEA0183* nmea0183,
+                                 Stream* serial,
                                  AutonnicPATCWIMWVParser* parser,
                                  String config_path = "")
       : Configurable(config_path),
-        AsyncCommand(),
         repetition_rate_{repetition_rate},
-        nmea0183_{nmea0183},
+        serial_{serial},
         parser_{parser} {
-    parser->result_.connect_to(new LambdaConsumer<bool>([this](bool result) {
-      report_result(result, result);  // Result also indicates success status
-    }));
     load_configuration();
+
+    parser->connect_to(&set_response_handler_);
   }
 
   virtual void get_configuration(JsonObject& doc) override {
@@ -452,7 +354,7 @@ class WindOutputRepetitionRateConfig : public Configurable,
   virtual ConfigurableResult async_get_configuration() override {
     // Autonnic A5120 does not support getting the configuration. Indicate
     // that the locally stored configuration is available.
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual ConfigurableResult poll_get_result(
@@ -460,7 +362,7 @@ class WindOutputRepetitionRateConfig : public Configurable,
     // Autonnic A5120 does not support getting the configuration, so just
     // return the current locally stored configuration.
     get_configuration(config_object);
-    return ConfigurableResult::kConfigOk;
+    return ConfigurableResult::kOk;
   }
 
   virtual bool set_configuration(const JsonObject& config) override {
@@ -477,37 +379,35 @@ class WindOutputRepetitionRateConfig : public Configurable,
   virtual ConfigurableResult async_set_configuration(
       const JsonObject& config) override {
     if (!set_configuration(config)) {
-      return ConfigurableResult::kConfigError;
+      return ConfigurableResult::kError;
     }
-    this->send(repetition_rate_);
-    return ConfigurableResult::kConfigPending;
+    // Send the command to the device
+    ESP_LOGD("WindOutputRepetitionRate", "Sending command: %f",
+             repetition_rate_);
+    String sentence = AutonnicMessageRepetitionRateSentence(repetition_rate_);
+    ESP_LOGD("WindOutputRepetitionRate", "Sending sentence: %s",
+             sentence.c_str());
+    serial_->println(sentence.c_str());
+    set_response_handler_.activate();
+    return ConfigurableResult::kPending;
   }
 
   virtual ConfigurableResult poll_set_result() override {
-    ESP_LOGV("WindOutputRepetitionRate", "status_: %d", status_);
-    switch (status_) {
-      case kReady:
-        return ConfigurableResult::kConfigOk;
-      case kPending:
-        return ConfigurableResult::kConfigPending;
-      case kSuccess:
-        return ConfigurableResult::kConfigOk;
-      case kFailure:
-        return ConfigurableResult::kConfigError;
-      case kTimeout:
-        return ConfigurableResult::kConfigError;
+    auto status = set_response_handler_.get_status();
+    ESP_LOGV("WindOutputRepetitionRate", "status_: %d", status);
+    switch (status) {
+      case AsyncResponseStatus::kReady:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kPending:
+        return ConfigurableResult::kPending;
+      case AsyncResponseStatus::kSuccess:
+        return ConfigurableResult::kOk;
+      case AsyncResponseStatus::kFailure:
+        return ConfigurableResult::kError;
+      case AsyncResponseStatus::kTimeout:
+        return ConfigurableResult::kError;
     }
-    return ConfigurableResult::kConfigError;
-  }
-
-  virtual bool send_command(float value) override {
-    // Send the command to the device
-    ESP_LOGD("WindOutputRepetitionRate", "Sending command: %f", value);
-    String sentence = AutonnicMessageRepetitionRateSentence(value);
-    ESP_LOGD("WindOutputRepetitionRate", "Sending sentence: %s",
-             sentence.c_str());
-    nmea0183_->output_raw(sentence.c_str());
-    return true;  // Cannot fail
+    return ConfigurableResult::kError;
   }
 
   virtual String get_config_schema() override {
@@ -522,8 +422,9 @@ class WindOutputRepetitionRateConfig : public Configurable,
 
  protected:
   float repetition_rate_;  // Damping factor in percent
-  const NMEA0183* nmea0183_;
+  Stream* serial_;
   AutonnicPATCWIMWVParser* parser_;
+  AsyncResponseHandler set_response_handler_;
 };
 
 #endif  // AUTONNIC_WIND_SRC_AUTONNIC_CONFIG_H_
