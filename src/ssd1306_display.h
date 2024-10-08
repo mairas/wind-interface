@@ -5,8 +5,8 @@
 #include <Adafruit_SSD1306.h>
 #include <sensesp/system/lambda_consumer.h>
 
+#include "sensesp.h"
 #include "sensesp_app.h"
-#include "sensesp_base_app.h"
 
 namespace sensesp {
 
@@ -24,7 +24,7 @@ class InfoDisplay {
       return;
     }
 
-    ReactESP::app->onDelay(50, [this]() {
+    event_loop()->onDelay(50, [this]() {
       display_->setRotation(2);
       display_->clearDisplay();
       display_->setTextSize(1);
@@ -33,7 +33,7 @@ class InfoDisplay {
 
       display_->display();
 
-      ReactESP::app->onRepeat(1000, [this]() { update(); });
+      event_loop()->onRepeat(1000, [this]() { update(); });
     });
   }
 
